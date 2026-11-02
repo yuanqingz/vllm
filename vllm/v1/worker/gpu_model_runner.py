@@ -4025,6 +4025,10 @@ class GPUModelRunner(
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded
+        elif self.parallel_config.subgpu_pipelining and allow_microbatching:
+            should_ubatch = check_ubatch_thresholds(
+                self.parallel_config, num_tokens, uniform_decode=uniform_decode
+            )
 
         cudagraph_stats = None
         if self.vllm_config.observability_config.cudagraph_metrics:
@@ -5939,7 +5943,9 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens,
                 max_num_scheduled_tokens=max_query_len,
                 use_cascade_attn=False,
-                allow_microbatching=allow_microbatching,
+                # The profile run has no per-micro-batch attention metadata.
+                allow_microbatching=allow_microbatching
+                and not (is_profile and self.parallel_config.subgpu_pipelining),
                 force_eager=is_profile
                 or (cudagraph_runtime_mode == CUDAGraphMode.NONE),
                 # `force_uniform_decode` is used for cudagraph capture; because for

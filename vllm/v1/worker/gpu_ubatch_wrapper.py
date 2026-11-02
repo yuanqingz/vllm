@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.deep_gemm import set_num_sms as deep_gemm_set_num_sms
 from vllm.utils.import_utils import has_deep_gemm
 from vllm.utils.platform_utils import num_compute_units
+from vllm.v1.worker.greenctx_pool import GreenContextPools
 from vllm.v1.worker.ubatching import UBatchContext, make_ubatch_contexts
 
 logger = init_logger(__name__)
@@ -139,6 +141,27 @@ class UBatchWrapper:
         self.device = device
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
         self._runnable_str = str(runnable) if self.is_debugging_mode else None
+
+        parallel_config = vllm_config.parallel_config
+        self.subgpu = parallel_config.subgpu_pipelining
+        self.schedule = parallel_config.subgpu_schedule if self.subgpu else "default"
+        self.subgpu_pools: GreenContextPools | None = None
+        self.attn_stream: torch.cuda.Stream | None = None
+        self.rest_streams: list[torch.cuda.Stream] | None = None
+        if self.subgpu:
+            if self.schedule == "subgpu":
+                index = torch.device(device).index
+                self.subgpu_pools = GreenContextPools(
+                    torch.cuda.current_device() if index is None else index,
+                    parallel_config.subgpu_attn_sms,
+                    parallel_config.subgpu_rest_sms,
+                    parallel_config.subgpu_rest_streams,
+                )
+                self.attn_stream = self.subgpu_pools.attn_stream
+                self.rest_streams = self.subgpu_pools.rest_streams
+                self.comm_stream = self.rest_streams[0]
+            # Green contexts partition the SMs; DBO's num_sms hints do not apply.
+            self.sm_control = contextlib.nullcontext()
 
     @property
     def graph_pool(self):
@@ -377,6 +400,8 @@ class UBatchWrapper:
             compute_stream=compute_stream,
             forward_contexts=forward_contexts,
             ready_barrier=self.ready_barrier,
+            schedule=self.schedule,
+            comm_streams=self.rest_streams,
         )
 
         ubatch_metadata: list[UbatchMetadata] = []
@@ -470,14 +495,25 @@ class UBatchWrapper:
         positions = kwargs["positions"]
         intermediate_tensors = kwargs["intermediate_tensors"]
         inputs_embeds = kwargs["inputs_embeds"]
-        compute_stream = torch.cuda.current_stream()
+        caller_stream = torch.cuda.current_stream()
+        compute_stream = caller_stream
+        if self.attn_stream is not None:
+            compute_stream = self.attn_stream
+            compute_stream.wait_stream(caller_stream)
 
         dp_metadata = forward_context.dp_metadata
+        # SubGPU pipelining on a single GPU has no DP ranks to coordinate.
+        single_gpu = (
+            self.subgpu and self.vllm_config.parallel_config.data_parallel_size == 1
+        )
 
         # We shouldn't be here unless we are running with multiple DP ranks
-        assert dp_metadata is not None
-        ubatch_dp_metadata = []
+        assert single_gpu or dp_metadata is not None
+        ubatch_dp_metadata: list[DPMetadata | None] = []
         for ubatch_slice in ubatch_slices:
+            if single_gpu:
+                ubatch_dp_metadata.append(None)
+                continue
             dp_size = self.vllm_config.parallel_config.data_parallel_size
             ubatch_num_tokens_across_dp = torch.tensor(
                 [ubatch_slice.num_tokens] * dp_size, device="cpu", dtype=torch.int32
@@ -508,7 +544,10 @@ class UBatchWrapper:
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             )
             with self.sm_control:
-                return self._capture_ubatches(ubatch_metadata, self.runnable)
+                return self._subgpu_join(
+                    self._capture_ubatches(ubatch_metadata, self.runnable),
+                    caller_stream,
+                )
         elif (
             num_tokens in self.cudagraphs
             and cudagraph_runtime_mode is CUDAGraphMode.FULL
@@ -517,8 +556,10 @@ class UBatchWrapper:
             # Sync offloader before replay - ensures any external dependencies
             # from pre-capture prefetches are satisfied.
             get_offloader().sync_prev_onload()
-            cudagraph_metadata.cudagraph.replay()
-            return cudagraph_metadata.outputs
+            # Replay on the attention pool's stream so that the pools apply.
+            with torch.cuda.stream(compute_stream):
+                cudagraph_metadata.cudagraph.replay()
+            return self._subgpu_join(cudagraph_metadata.outputs, caller_stream)
         else:
             ubatch_metadata = self._make_ubatch_metadata(
                 ubatch_slices=ubatch_slices,
@@ -534,4 +575,13 @@ class UBatchWrapper:
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             )
             with self.sm_control:
-                return self._run_ubatches(ubatch_metadata, self.runnable)
+                return self._subgpu_join(
+                    self._run_ubatches(ubatch_metadata, self.runnable),
+                    caller_stream,
+                )
+
+    def _subgpu_join(self, output, caller_stream: torch.cuda.Stream):
+        """Make the caller's stream wait for micro-batches run on the pools."""
+        if self.attn_stream is not None:
+            caller_stream.wait_stream(self.attn_stream)
+        return output
