@@ -86,3 +86,15 @@ The `dbo_register_recv_hook` method registers a callback that can be returned by
 The `dbo_maybe_run_recv_hook` method runs a callback that’s set by the `dbo_register_recv_hook` function if that callback exists.
 
 The `dbo_yield` method puts the current thread to sleep and wakes up the other UBatch thread.
+
+## SubGPU Pipelining
+
+SubGPU pipelining (`--subgpu-pipelining`, experimental) reuses the DBO runtime to overlap a different pair of operations. It splits the SMs into two CUDA green-context pools and runs the attention of one micro-batch on the attention pool while the rest of the layer of the other micro-batch runs on the rest pool. Decode attention is bound by HBM bandwidth and the rest of the layer by tensor-core throughput or launch latency, so the two overlap when the attention kernel can saturate HBM from a partial pool.
+
+The micro-batches start on the attention pool's stream. Models place their stages with `dbo_subgpu_ensure_attn()` and `dbo_subgpu_ensure_rest()`, which do nothing outside a SubGPU micro-batch; gpt-oss runs only its full-attention kernels on the attention pool. Each micro-batch has its own stream in the rest pool, so one micro-batch's all-to-all does not block the other's kernels.
+
+* `--subgpu-attn-sms` and `--subgpu-rest-sms` (default 64 and 84) size the pools; one of them must be a multiple of 8.
+* `--subgpu-rest-streams` (default 2) sets the number of streams in the rest pool.
+* `--subgpu-schedule dbo` runs the same micro-batching on the whole GPU without pools, as a baseline.
+
+The mode pays off only with full CUDA graphs, and capturing green-context streams requires CUDA 13.4 or later. Micro-batching follows the DBO token thresholds. With `--data-parallel-size 1` and no expert parallelism it runs on a single GPU without an all-to-all backend.
