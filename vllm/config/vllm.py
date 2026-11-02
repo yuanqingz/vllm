@@ -1569,7 +1569,13 @@ class VllmConfig:
 
         if self.parallel_config.use_ubatching:
             a2a_backend = self.parallel_config.all2all_backend
-            assert a2a_backend in [
+            # Single-GPU SubGPU pipelining has no all-to-all to overlap.
+            subgpu_single_gpu = (
+                self.parallel_config.subgpu_pipelining
+                and self.parallel_config.data_parallel_size == 1
+                and not self.parallel_config.enable_expert_parallel
+            )
+            assert subgpu_single_gpu or a2a_backend in [
                 "deepep_low_latency",
                 "deepep_high_throughput",
                 "nixl_ep",
@@ -2220,6 +2226,9 @@ class VllmConfig:
 
         if self.parallel_config.enable_dbo:
             unsupported.append("dual batch overlap")
+
+        if self.parallel_config.subgpu_pipelining:
+            unsupported.append("SubGPU pipelining")
 
         if self.parallel_config.enable_elastic_ep:
             unsupported.append("elastic expert parallelism")

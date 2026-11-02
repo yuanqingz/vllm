@@ -1577,6 +1577,22 @@ def test_fault_tolerance_requires_single_api_server():
     ParallelConfig(enable_fault_tolerance=True, _api_process_count=1)
 
 
+def test_subgpu_pipelining_uses_two_micro_batches():
+    assert not ParallelConfig().use_ubatching
+    config = ParallelConfig(subgpu_pipelining=True)
+    assert config.use_ubatching
+    assert config.num_ubatches == 2
+
+
+def test_subgpu_pipelining_config_validation():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        ParallelConfig(subgpu_pipelining=True, enable_dbo=True)
+    with pytest.raises(ValueError, match="multiple of 8"):
+        ParallelConfig(subgpu_pipelining=True, subgpu_attn_sms=66, subgpu_rest_sms=82)
+    # The green-context split needs only one of the two pools 8-SM aligned.
+    ParallelConfig(subgpu_pipelining=True, subgpu_attn_sms=64, subgpu_rest_sms=84)
+
+
 def test_renderer_num_workers_with_mm_cache():
     """Disallow renderer_num_workers > 1 with the mm processor cache only for
     pooling models, whose preprocessing runs on the renderer workers."""
